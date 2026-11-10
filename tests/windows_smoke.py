@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 import ctypes as ct
 from ctypes import wintypes as win
+import os
 from pathlib import Path
 import re
 import shutil
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import time
 import uuid
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -130,6 +132,7 @@ class Desktop:
         flags = 0x0013  # no activation, movement, or resize
         self.check(self.user.SetWindowPos(window, -1, 0, 0, 0, 0, flags), "show the test title bar")
         try:
+            time.sleep(0.1)
             rect = self.rect(window)
             x = rect.left + (rect.right - rect.left) // 3
             for offset in (16, 24, 32, 40, 48):
@@ -188,13 +191,13 @@ class Desktop:
         if window is None:
             return
         pid = win.DWORD()
-        self.check(self.user.GetWindowThreadProcessId(window, ct.byref(pid)), "identify test Chrome")
+        self.check(self.user.GetWindowThreadProcessId(window, ct.byref(pid)), "identify the test app")
         process = self.kernel.OpenProcess(0x00100000, False, pid.value)
-        self.check(process, "open test Chrome for shutdown verification")
+        self.check(process, "open the test app for shutdown verification")
         try:
-            self.check(self.user.PostMessageW(window, 0x0010, 0, 0), "close the test Chrome window")
+            self.check(self.user.PostMessageW(window, 0x0010, 0, 0), "close the test window")
             require(self.kernel.WaitForSingleObject(process, WAIT * 1000) == 0,
-                    "Isolated Chrome did not shut down after closing its test window")
+                    "The test app did not shut down after closing its window")
         finally:
             self.kernel.CloseHandle(process)
 
@@ -318,6 +321,143 @@ def test_imports(exe, compiler):
     print(f"PE imports verified ({len(imports)} Windows system DLLs)", flush=True)
 
 
+def test_popout(desktop, command, workspace, chrome, exe):
+    prefix = f"click-helper-{uuid.uuid4().hex}-"
+    page = workspace / "parent.html"
+    popup = workspace / "popout.html"
+    page.write_text(f"""<!doctype html><title>{prefix}main-ready</title>
+<button style="position:fixed;inset:0;width:100%" id="open">Open popout</button>
+<script>
+document.getElementById('open').onclick = () => window.open(
+    'popout.html', '_blank', 'popup,width=440,height=360,left=140,top=200');
+window.onmessage = (event) => {{
+    if (event.data === 'clicked') document.title = '{prefix}main-pass';
+}};
+</script>""", encoding="utf-8")
+    popup_html = f"""<!doctype html><title>{prefix}popup-ready</title>
+<button style="position:fixed;inset:0;width:100%" id="done">Finish</button>
+<script>
+document.getElementById('done').onclick = () => {{
+    window.opener.postMessage('clicked', '*');
+    window.close();
+}};
+</script>"""
+    popup.write_text(popup_html, encoding="utf-8")
+    main_prefix = prefix + "main-"
+    app = [*chrome[:-1], f"--app={page.as_uri()}"]
+    recorder = [*command, "record", "--follow-popout", "--position", "absolute", "--timeout", "8", "--", *app]
+
+    try:
+        with running(recorder, workspace) as (process, diagnostics, ready, focus_requested):
+            main = desktop.wait_focus(main_prefix, process, focus_requested)
+            require(ready.wait(WAIT) and any(line.startswith("Recording.") for line in diagnostics),
+                    "Recorder did not arm for the popout test")
+            desktop.click(main, second=False)
+            child = desktop.wait_title(prefix + "popup-ready", process)
+            require(child != main, "The site did not open a separate window")
+            desktop.click(child, second=False)
+            desktop.wait_title(main_prefix + "pass", process)
+            end = time.monotonic() + 5
+            while desktop.window(prefix + "popup-") and time.monotonic() < end:
+                time.sleep(0.03)
+            require(not desktop.window(prefix + "popup-"), "The test popout did not close")
+            if desktop.user.GetForegroundWindow() != main:
+                desktop.activate_fixture(main)
+            desktop.escape(main)
+            require(process.wait(timeout=WAIT) == 0, "Recorder did not save the popout sequence")
+    finally:
+        close_popout_fixture(desktop, prefix)
+
+    header = (workspace / "generated/windows/config.h").read_text(encoding="ascii")
+    clicks = re.findall(r"^    \{\d+, \d+\},$", header, re.MULTILINE)
+    require(len(clicks) == 2, f"Expected two recorded clicks, found {len(clicks)}")
+    subprocess.run([*command, "build"], cwd=workspace, check=True)
+    try:
+        with running([str(exe)], workspace) as (process, _, _, focus_requested):
+            desktop.wait_focus(main_prefix, process, focus_requested)
+            desktop.wait_title(main_prefix + "pass", process)
+            require(process.wait(timeout=WAIT) == 0, "Popout playback did not complete")
+    finally:
+        close_popout_fixture(desktop, prefix)
+    print("Website popout recording and standalone playback passed", flush=True)
+
+    popup.write_text(popup_html.replace("popup-ready", "popup-unexpected"), encoding="utf-8")
+    try:
+        with running([str(exe)], workspace) as (process, diagnostics, _, focus_requested):
+            desktop.wait_focus(main_prefix, process, focus_requested)
+            desktop.wait_title(prefix + "popup-unexpected", process)
+            require(process.wait(timeout=WAIT) != 0, "Player accepted a popout with a different title")
+            require(desktop.window(prefix + "popup-unexpected") and not desktop.window(main_prefix + "pass"),
+                    "Player sent a click to the wrong popout")
+            require(any("recorded popout did not open" in line for line in diagnostics),
+                    "Player failed for a reason other than the unmatched popout")
+    finally:
+        close_popout_fixture(desktop, prefix)
+    print("Playback rejected a popout with a different title", flush=True)
+
+
+def close_popout_fixture(desktop, prefix):
+    child = desktop.window(prefix + "popup-")
+    if child:
+        desktop.check(desktop.user.PostMessageW(child, 0x0010, 0, 0), "close the test popout")
+    desktop.close(prefix + "main-")
+
+
+def test_bubbles(desktop, command, workspace, compiler, exe):
+    app = workspace / "bubble-fixture.exe"
+    subprocess.run([str(compiler), "-std=c11", "-Wall", "-Wextra", "-Werror", "-municode", "-static",
+                    str(ROOT / "tests/windows_bubble_fixture.c"), "-luser32", "-o", str(app)], check=True)
+    prefix = f"click-helper-{uuid.uuid4().hex}-"
+    recorder = [*command, "record", "--position", "absolute", "--timeout", "5", "--", str(app), prefix]
+
+    def close_fixture():
+        desktop.close(prefix + "-pass")
+        desktop.close(prefix + "-ready")
+
+    try:
+        with running(recorder, workspace) as (process, diagnostics, ready, focus_requested):
+            main = desktop.wait_focus(prefix + "-", process, focus_requested)
+            require(ready.wait(WAIT) and any(line.startswith("Recording.") for line in diagnostics),
+                    "Recorder did not arm for the attached-popup test")
+            desktop.click(main, second=False)
+            for step in (1, 2):
+                bubble = desktop.wait_title(f"{prefix}-bubble{step}", process)
+                foreground = bubble if step == 1 else main
+                require(desktop.user.GetForegroundWindow() == foreground, "Fixture focus is incorrect")
+                rect = desktop.rect(bubble)
+                desktop.point_at(bubble, (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2)
+                desktop.left_click()
+            desktop.wait_title(prefix + "-pass", process)
+            desktop.escape(main)
+            require(process.wait(timeout=WAIT) == 0, "Recorder did not save the attached-popup sequence")
+    finally:
+        close_fixture()
+
+    subprocess.run([*command, "build"], cwd=workspace, check=True)
+    try:
+        with running([str(exe)], workspace) as (process, _, _, focus_requested):
+            desktop.wait_focus(prefix + "-", process, focus_requested)
+            desktop.wait_title(prefix + "-pass", process)
+            require(process.wait(timeout=WAIT) == 0, "Attached-popup playback did not complete")
+    finally:
+        close_fixture()
+    print("Attached popup playback passed with and without popup activation", flush=True)
+
+    try:
+        with patch.dict(os.environ, {"CLICK_HELPER_SMOKE_SHIFT_BUBBLE": "1"}):
+            with running([str(exe)], workspace) as (process, diagnostics, _, focus_requested):
+                desktop.wait_focus(prefix + "-", process, focus_requested)
+                desktop.wait_title(prefix + "-bubble1", process)
+                require(process.wait(timeout=WAIT) != 0, "Player accepted a shifted attached popup")
+                require(desktop.window(prefix + "-bubble1") and not desktop.window(prefix + "-bubble2"),
+                        "The player clicked a shifted popup")
+                require(any("attached popup did not match" in line for line in diagnostics),
+                        "Player failed for a reason other than the shifted popup")
+    finally:
+        close_fixture()
+    print("Playback rejected a shifted attached popup", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cc", default="x86_64-w64-mingw32-clang.exe")
@@ -343,7 +483,7 @@ def main():
         profile = workspace / "isolated Chrome 雪"
         chrome = [str(args.chrome), f"--user-data-dir={profile}", "--no-first-run",
                   "--no-default-browser-check", "--disable-background-mode",
-                  "--disable-background-networking", f"--app={page.as_uri()}"]
+                  "--disable-background-networking", "--window-position=40,40", f"--app={page.as_uri()}"]
         exe = workspace / "build/windows/click-helper.exe"
         header = workspace / "generated/windows/config.h"
         for mode in ("relative", "absolute"):
@@ -367,6 +507,8 @@ def main():
                 "The executable accepted an argument or launched Chrome")
         print("Argument rejection passed", flush=True)
         test_imports(exe, compiler)
+        test_popout(desktop, command, workspace, chrome, exe)
+        test_bubbles(desktop, command, workspace, compiler, exe)
 
 
 if __name__ == "__main__":

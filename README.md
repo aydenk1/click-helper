@@ -43,12 +43,27 @@ if the app loses focus, the recorded size, placement, or DPI changes, or a click
 would land outside the target window. Relative mode allows the window to move
 between clicks.
 
+If a click on a website opens a separate Chrome window, add `--follow-popout`
+before `--` in the `record` command. Record the click that opens the window,
+wait for the popout to finish loading, then click inside it. The recorder can
+follow one new popout during a sequence. Playback waits for a newly opened
+window in the same browser process and checks its title, size, and DPI before
+clicking in it. Keep the original window open. If closing the popout changes
+focus, select the original window from the taskbar before continuing to record.
+A different or ambiguous popout stops playback.
+
+Chrome toolbar menus and extension bubbles attached to the recorded browser
+window are captured in the normal recording mode. Replay checks the popup's
+window ownership, class, bounds relative to Chrome, and DPI before clicking.
+Record again if an extension toolbar or popup layout has changed.
+
 The private recording is `generated/windows/config.h`. The Windows build output
 is `build/windows/click-helper.exe`. These directories are ignored by Git. The
 executable embeds the sequence and launch arguments, which can be inspected.
 
-The opt-in smoke test uses the actual Windows pointer in an isolated Chrome
-window. It creates a temporary Chrome profile and a local two-button test page.
+The opt-in smoke test uses the actual Windows pointer in isolated Chrome
+windows. It creates a temporary Chrome profile and local pages to test regular
+clicks and a website-opened popout.
 Run it on an unlocked desktop and leave the pointer free while it runs.
 
 ```powershell
