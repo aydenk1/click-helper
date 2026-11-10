@@ -1,4 +1,61 @@
-# Click helper for Hyprland / Omarchy
+# Click helper for Hyprland / Omarchy and Windows
+
+Record a sequence of left-clicks in an app and build a standalone replay executable.
+Use the [Windows workflow](#windows) or the Hyprland workflow below.
+
+## Windows
+
+Use an unlocked x64 Windows 10 (version 1703 or newer) or Windows 11 desktop.
+Recording and building require Python 3.10+ and the x64 Windows UCRT package
+from [LLVM-MinGW releases](https://github.com/mstorsjo/llvm-mingw/releases).
+Extract the package and put its `bin` directory on `PATH`, or pass
+`--cc FULL_COMPILER_PATH` before `record` or `build`.
+
+From the checkout in a Windows terminal:
+
+```powershell
+py tools/windows.py record -- "C:\Program Files\Google\Chrome\Application\chrome.exe" --new-window about:blank
+py tools/windows.py build
+.\build\windows\click-helper.exe
+```
+
+1. Wait for the recorder to report that it is ready. If the helper asks you to
+   activate the target, select the app from the taskbar.
+2. Left-click the sequence inside the target window. Each click goes through to
+   the app as you record. Press **Esc** to save or **Ctrl+C** in the launching
+   console to cancel. A failed or empty recording preserves the last saved profile.
+3. Close or reset the app before replaying. Run `build` after changing the
+   recording. The resulting `click-helper.exe` takes zero arguments and runs
+   with Windows system libraries. It launches the recorded app from the saved
+   absolute executable path and leaves the app open.
+
+The Windows recorder accepts `--width`, `--height`, `--position relative|absolute`,
+`--match-class`, `--startup-delay`, `--click-delay`, and `--timeout` before `--`.
+The default is an 800×600 window at its launch position. Width and height refer
+to the outer window rectangle in physical pixels. Absolute mode places that
+rectangle at desktop `(0, 0)`. Use a resizable window that fits on your monitor.
+The helper prefers a new window and uses an already-open window only when its
+executable and class match and the launch activates it. Record a new sequence if
+the display scale, app layout, or initial app state changes. Windows input
+permissions apply, so launch normal apps and the helper at the same elevation.
+Keep the app visible and avoid using the mouse during playback. Playback stops
+if the app loses focus, the recorded size, placement, or DPI changes, or a click
+would land outside the target window. Relative mode allows the window to move
+between clicks.
+
+The private recording is `generated/windows/config.h`. The Windows build output
+is `build/windows/click-helper.exe`. These directories are ignored by Git. The
+executable embeds the sequence and launch arguments, which can be inspected.
+
+The opt-in smoke test uses the actual Windows pointer in an isolated Chrome
+window. It creates a temporary Chrome profile and a local two-button test page.
+Run it on an unlocked desktop and leave the pointer free while it runs.
+
+```powershell
+py tests/windows_smoke.py
+```
+
+## Hyprland / Omarchy
 
 Record a GUI sequence, then bake its program, arguments, position mode, window size and click
 positions into a C executable that takes **no arguments**. Everything works
